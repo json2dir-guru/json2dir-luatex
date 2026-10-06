@@ -1,0 +1,36 @@
+#!/bin/sh
+# LuaTeX (json2dir.tex) owns the JSON parsing, validation, traversal and shell generation.
+# LuaTeX runs sandboxed (--safer, no shell escape), so this launcher runs the script it writes.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 1
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+evaluator=${JSON2DIR_EVALUATOR:-$script_dir/json2dir.tex}
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "Error: couldn't read stdin." >&2
+  exit 1
+fi
+
+# Run LuaTeX inside the temp dir: the .log and the generated script land there, never in
+# the target directory. Nothing is executed unless the evaluator succeeded.
+if ! (
+  umask 077
+  cd -- "$task_tmp"
+  "${JSON2DIR_LUATEX:-luatex}" --ini --safer --no-shell-escape -interaction=batchmode \
+    -output-directory="$task_tmp" \
+    "\\catcode123=1 \\catcode125=2 \\def\\inputfile{input.json}\\input{$evaluator}" \
+    < /dev/null > /dev/null
+) || [ ! -f "$task_tmp/json2dir-tree.sh" ]; then
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/json2dir-tree.sh"

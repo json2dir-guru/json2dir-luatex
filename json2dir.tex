@@ -1,0 +1,270 @@
+% json2dir.tex -- the json2dir evaluator, written for LuaTeX (RFC J2D-1).
+%
+% Run by the `json2dir` launcher in a sandbox (--safer, no shell escape):
+%   luatex --ini --safer --no-shell-escape -interaction=batchmode -output-directory=DIR \
+%     '\catcode123=1 \catcode125=2 \def\inputfile{input.json}\input{json2dir.tex}'
+% It reads \inputfile, validates the whole document and writes DIR/json2dir-tree.sh, a
+% POSIX shell script that creates the tree. Any error: message on stderr, exit 1, no script.
+%
+% TeX drives; the JSON work is done by LuaTeX's embedded Lua in \directlua. --safer
+% disables io.open (it uses io.input to read), so the script is written with \openout/\write: LuaTeX
+% writes characters to \write files as raw UTF-8 bytes (no ^^ notation, no line wrapping),
+% \newlinechar=10 turns LF into LF, and tex.sprint(-2, ...) turns every byte into a plain
+% "other" character token, so the bytes come out exactly as generated.
+\catcode`\{=1 \catcode`\}=2
+%
+% Read the Lua code with @ as the escape character and \ % and LF as ordinary characters,
+% so backslashes, Lua patterns and "--" comments survive. Braces must stay balanced.
+\begingroup \catcode`\%=12 \catcode10=12 \endlinechar=10 \catcode`\@=0 \catcode`\\=12
+@directlua{
+local byte, sub, char, find = string.byte, string.sub, string.char, string.find
+
+local function fail(msg) error({ msg = msg }, 0) end
+
+-- RFC 3: strict UTF-8
+local function check_utf8(s)
+  local i, n = 1, #s
+  while i <= n do
+    local c = byte(s, i)
+    if c < 0x80 then
+      i = i + 1
+    else
+      local len, min
+      if c >= 0xC2 and c <= 0xDF then len, min = 2, 0x80
+      elseif c >= 0xE0 and c <= 0xEF then len, min = 3, 0x800
+      elseif c >= 0xF0 and c <= 0xF4 then len, min = 4, 0x10000
+      else fail("input is not valid UTF-8") end
+      if i + len - 1 > n then fail("input is not valid UTF-8") end
+      local cp = c & (0x7F >> len)
+      for k = 1, len - 1 do
+        local d = byte(s, i + k)
+        if d < 0x80 or d > 0xBF then fail("input is not valid UTF-8") end
+        cp = cp * 64 + (d - 0x80)
+      end
+      if cp < min or cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) then
+        fail("input is not valid UTF-8")
+      end
+      i = i + len
+    end
+  end
+end
+
+-- RFC 3, 4: strict JSON. Objects -> {obj=true, keys=..., map=...}, arrays -> {arr=true, ...},
+-- strings -> Lua strings. Numbers, true, false, null are rejected right away (RFC 4.5).
+local function parse(s)
+  local pos = 1
+  local escapes = { [34] = '"', [92] = "\\", [47] = "/", [98] = "\b", [102] = "\f",
+    [110] = "\n", [114] = "\r", [116] = "\t" }
+
+  local function skip_ws() pos = find(s, "[^ \t\r\n]", pos) or #s + 1 end
+  local function bad(what) fail("input is not valid JSON: " .. what .. " at byte " .. pos) end
+
+  local function hex4()
+    local h = sub(s, pos, pos + 3)
+    if not h:match("^%x%x%x%x$") then bad("bad \\u escape") end
+    pos = pos + 4
+    return tonumber(h, 16)
+  end
+
+  local function parse_string()
+    pos = pos + 1
+    local buf = {}
+    while true do
+      local j = find(s, '["\\%c]', pos)
+      if not j then bad("unterminated string") end
+      if j > pos then buf[#buf + 1] = sub(s, pos, j - 1) end
+      local c = byte(s, j)
+      pos = j + 1
+      if c == 34 then
+        return table.concat(buf)
+      elseif c == 92 then
+        local e = byte(s, pos)
+        if e == 117 then
+          pos = pos + 1
+          local cp = hex4()
+          if cp >= 0xD800 and cp <= 0xDBFF then
+            if sub(s, pos, pos + 1) ~= "\\u" then bad("unpaired surrogate") end
+            pos = pos + 2
+            local lo = hex4()
+            if lo < 0xDC00 or lo > 0xDFFF then bad("unpaired surrogate") end
+            cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00)
+          elseif cp >= 0xDC00 and cp <= 0xDFFF then
+            bad("unpaired surrogate")
+          end
+          buf[#buf + 1] = utf8.char(cp)
+        elseif e and escapes[e] then
+          buf[#buf + 1] = escapes[e]
+          pos = pos + 1
+        else
+          bad("bad escape")
+        end
+      elseif c == 127 then
+        buf[#buf + 1] = "\127"
+      else
+        bad("control character in string")
+      end
+    end
+  end
+
+  local parse_value
+
+  local function parse_object(depth)
+    pos = pos + 1
+    local o = { obj = true, keys = {}, map = {} }
+    skip_ws()
+    if byte(s, pos) == 125 then pos = pos + 1; return o end
+    while true do
+      skip_ws()
+      if byte(s, pos) ~= 34 then bad("expected member name") end
+      local name = parse_string()
+      skip_ws()
+      if byte(s, pos) ~= 58 then bad("expected ':'") end
+      pos = pos + 1
+      local v = parse_value(depth + 1)
+      if o.map[name] == nil then o.keys[#o.keys + 1] = name end
+      o.map[name] = v -- duplicate names: the last occurrence wins (RFC 4.2)
+      skip_ws()
+      local c = byte(s, pos)
+      pos = pos + 1
+      if c == 125 then return o end
+      if c ~= 44 then pos = pos - 1; bad("expected ',' or end of object") end
+    end
+  end
+
+  local function parse_array(depth)
+    pos = pos + 1
+    local a = { arr = true }
+    skip_ws()
+    if byte(s, pos) == 93 then pos = pos + 1; return a end
+    while true do
+      a[#a + 1] = parse_value(depth + 1)
+      skip_ws()
+      local c = byte(s, pos)
+      pos = pos + 1
+      if c == 93 then return a end
+      if c ~= 44 then pos = pos - 1; bad("expected ',' or ']'") end
+    end
+  end
+
+  function parse_value(depth)
+    if depth > 1000 then bad("nesting too deep") end
+    skip_ws()
+    local c = byte(s, pos)
+    if c == 123 then return parse_object(depth)
+    elseif c == 91 then return parse_array(depth)
+    elseif c == 34 then return parse_string()
+    elseif c == nil then bad("unexpected end of input")
+    elseif find(s, "^[-0-9tfn]", pos) then bad("numbers, true, false and null are not allowed")
+    else bad("unexpected character") end
+  end
+
+  if sub(s, 1, 3) == "\239\187\191" then pos = 4 end -- optional BOM
+  local v = parse_value(0)
+  skip_ws()
+  if pos <= #s then bad("trailing data") end
+  return v
+end
+
+-- names in ascending order of their UTF-8 bytes, whatever the locale
+local function byteless(a, b)
+  for i = 1, math.min(#a, #b) do
+    local x, y = byte(a, i), byte(b, i)
+    if x ~= y then return x < y end
+  end
+  return #a < #b
+end
+
+local function quote(s) return "'" .. (s:gsub("'", "'\\''")) .. "'" end
+
+-- RFC 4 (validation of the whole document) and RFC 5 (as shell code), in one walk.
+local function walk(o, dir, out)
+  local keys = {}
+  for _, k in ipairs(o.keys) do keys[#keys + 1] = k end
+  table.sort(keys, byteless)
+  for _, name in ipairs(keys) do
+    local path = dir .. "/" .. name
+    if name == "" or name == "." or name == ".." or find(name, "/", 1, true) or find(name, "\0", 1, true) then
+      fail(path .. ": invalid name")
+    end
+    local v, q = o.map[name], quote(path)
+    out[#out + 1] = "_json2dir_remove " .. q
+    if type(v) == "string" then
+      if find(v, "\0", 1, true) then fail(path .. ": content with NUL cannot be passed to the shell") end
+      out[#out + 1] = "_json2dir_file " .. q .. " " .. quote(v)
+    elseif v.arr then
+      if #v ~= 2 or type(v[1]) ~= "string" or type(v[2]) ~= "string" then
+        fail(path .. ': an array must be ["link", target] or ["script", content]')
+      end
+      if v[1] ~= "link" and v[1] ~= "script" then fail(path .. ": unknown array kind " .. v[1]) end
+      if find(v[2], "\0", 1, true) then fail(path .. ": " .. v[1] .. " payload with NUL cannot be passed to the shell") end
+      out[#out + 1] = "_json2dir_" .. v[1] .. " " .. q .. " " .. quote(v[2])
+    else
+      out[#out + 1] = "_json2dir_directory " .. q
+      walk(v, path, out)
+    end
+  end
+end
+
+-- Only constant code here; every name, content and target is a single-quoted word.
+local helpers = [[
+set -eu
+_json2dir_error() {
+  printf 'Error: couldn\047t create %s at %s.\n' "$1" "$2" >&2
+  exit 1
+}
+_json2dir_remove() {
+  rm -f -- "$1" 2>/dev/null || :
+}
+_json2dir_directory() {
+  if [ ! -d "$1" ]; then
+    mkdir -- "$1" || _json2dir_error directory "$1"
+  fi
+  (cd -- "$1") || _json2dir_error directory "$1"
+}
+_json2dir_file() {
+  printf '%s' "$2" > "$1" || _json2dir_error file "$1"
+}
+_json2dir_script() {
+  printf '%s' "$2" > "$1" || _json2dir_error script "$1"
+  chmod a+x "$1" || _json2dir_error script "$1"
+}
+_json2dir_link() {
+  if [ -d "$1" ] && [ ! -L "$1" ]; then
+    _json2dir_error symlink "$1"
+  fi
+  ln -s -- "$2" "$1" || _json2dir_error symlink "$1"
+}]]
+
+json2dir = {}
+
+-- Called from TeX: read, check and translate the input; on any error report and exit 1.
+function json2dir.run(file)
+  local ok, err = pcall(function()
+    -- --safer disables io.open entirely, but io.input(name) still opens a file for
+    -- reading (fopen "r": on POSIX the bytes come through unchanged).
+    local okf, f = pcall(io.input, file)
+    if not okf or not f then fail("couldn't read the input file") end
+    local s = f:read("a")
+    f:close()
+    if not s then fail("couldn't read the input file") end
+    check_utf8(s)
+    local root = parse(s)
+    if type(root) ~= "table" or not root.obj then fail("the root must be an object") end
+    local out = { helpers }
+    walk(root, ".", out)
+    json2dir.script = table.concat(out, "\n") -- \write adds the final newline
+  end)
+  if not ok then
+    io.stderr:write("json2dir: " .. (type(err) == "table" and err.msg or tostring(err)) .. "\n")
+    io.stderr:flush()
+    os.exit(1)
+  end
+end
+}@endgroup
+%
+\newlinechar=10
+\directlua{json2dir.run(token.get_macro("inputfile"))}
+\immediate\openout1=json2dir-tree.sh
+\immediate\write1{\directlua{tex.sprint(-2, json2dir.script)}}
+\immediate\closeout1
+\end
